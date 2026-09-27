@@ -16,7 +16,7 @@ const DefaultDiscoveryTimeout = 5 * time.Second
 // DiscoveryResult captures OAuth ProtectedResourceMetaData returned by the MCP server.
 type DiscoveryResult struct {
 	URL                string                         `json:"url,omitempty"`
-	FetchedAt          time.Time                      `json:"fetched_at,omitempty"`
+	FetchedAt          time.Time                      `json:"fetched_at"`
 	StatusCode         int                            `json:"status_code,omitempty"`
 	Headers            http.Header                    `json:"headers,omitempty"`
 	Body               json.RawMessage                `json:"body,omitempty"`

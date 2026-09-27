@@ -45,7 +45,7 @@ type LoginState struct {
 	LoginID         string    `json:"login_id,omitempty"`
 	VerificationURL string    `json:"verification_url,omitempty"`
 	UserCode        string    `json:"user_code,omitempty"`
-	StartedAt       time.Time `json:"started_at,omitempty"`
+	StartedAt       time.Time `json:"started_at"`
 	LastError       string    `json:"last_error,omitempty"`
 }
 
@@ -57,8 +57,8 @@ type ThreadState struct {
 	ModelProvider  string    `json:"model_provider,omitempty"`
 	ApprovalPolicy string    `json:"approval_policy,omitempty"`
 	Sandbox        string    `json:"sandbox,omitempty"`
-	CreatedAt      time.Time `json:"created_at,omitempty"`
-	UpdatedAt      time.Time `json:"updated_at,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type TurnState struct {
@@ -66,7 +66,7 @@ type TurnState struct {
 	ThreadID  string    `json:"thread_id,omitempty"`
 	Status    string    `json:"status,omitempty"`
 	Error     string    `json:"error,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Snapshot struct {
@@ -79,9 +79,9 @@ type Snapshot struct {
 	Ready              bool           `json:"ready"`
 	Initialized        bool           `json:"initialized"`
 	LastError          string         `json:"last_error,omitempty"`
-	StartedAt          time.Time      `json:"started_at,omitempty"`
-	LastExitAt         time.Time      `json:"last_exit_at,omitempty"`
-	InitializeInfo     InitializeInfo `json:"initialize_info,omitempty"`
+	StartedAt          time.Time      `json:"started_at"`
+	LastExitAt         time.Time      `json:"last_exit_at"`
+	InitializeInfo     InitializeInfo `json:"initialize_info"`
 	AuthMethod         string         `json:"auth_method,omitempty"`
 	RequiresOpenAIAuth *bool          `json:"requires_openai_auth,omitempty"`
 	Account            *Account       `json:"account,omitempty"`
