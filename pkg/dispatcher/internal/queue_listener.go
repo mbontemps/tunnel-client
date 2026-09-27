@@ -166,11 +166,9 @@ func newQueueListener(logger *slog.Logger, processor Processor, queue controlpla
 // Start begins draining the queue until the provided context is canceled or the queue is closed.
 func (l *QueueListener) Start(ctx context.Context) {
 	l.activityHealth.Accepting(true)
-	l.listenerWG.Add(1)
-	go func() {
-		defer l.listenerWG.Done()
+	l.listenerWG.Go(func() {
 		l.run(ctx)
-	}()
+	})
 }
 
 // Wait blocks until the listener has stopped processing commands.

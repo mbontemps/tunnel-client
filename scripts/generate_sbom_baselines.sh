@@ -35,13 +35,18 @@ source "${SCRIPT_DIR}/runtime_runfiles.sh"
 usage() {
   cat <<'EOF'
 Usage:
-  ./scripts/generate_sbom_baselines.sh --write [--output-dir <directory>]
+  ./scripts/generate_sbom_baselines.sh --write [--from-documents <directory>] [--output-dir <directory>]
   ./scripts/generate_sbom_baselines.sh --check [--flavor client|runtime|runtime-cloudflared] [--output-dir <directory>]
 
 Builds canonical six-platform payload unions and generates deterministic
 deterministic SPDX 2.3 baselines. --write updates the destination directory
 (compliance by default). --check compares freshly generated output with
 compliance; --output-dir optionally keeps the fresh output for inspection.
+
+--from-documents writes a manifest for the three complete hermetic SPDX
+documents without rebuilding or rewriting them. Use documents generated from
+this source and its pinned tools; retain the generation receipts and digests.
+The existing baseline gates must still pass after uploading the documents.
 EOF
 }
 
@@ -82,6 +87,7 @@ PY
 mode=""
 selected_flavor=""
 requested_output_dir=""
+documents_dir=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --write)
@@ -96,6 +102,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --flavor)
       selected_flavor="${2:-}"
+      shift 2
+      ;;
+    --from-documents)
+      [[ $# -ge 2 && -n "$2" ]] || die "--from-documents requires a directory"
+      [[ -z "${documents_dir}" ]] || die "--from-documents may be specified only once"
+      documents_dir="$2"
       shift 2
       ;;
     --output-dir)
@@ -122,8 +134,16 @@ if [[ "${mode}" == "write" && -n "${selected_flavor}" ]]; then
   die "--flavor is supported only with --check"
 fi
 
-use_tunnel_client_bazel_go_sdk || exit 1
-command -v go >/dev/null 2>&1 || die "go is required"
+if [[ -n "${documents_dir}" ]]; then
+  [[ "${mode}" == "write" ]] || die "--from-documents requires --write"
+  [[ -d "${documents_dir}" ]] || die "document directory is missing: ${documents_dir}"
+  documents_dir="$(cd "${documents_dir}" && pwd)"
+fi
+
+if [[ -z "${documents_dir}" ]]; then
+  use_tunnel_client_bazel_go_sdk || exit 1
+  command -v go >/dev/null 2>&1 || die "go is required"
+fi
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
 export LC_ALL=C
@@ -141,13 +161,15 @@ required_go_version="$(
 )"
 [[ "${required_go_version}" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] ||
   die "go.mod does not declare an exact Go version"
-actual_go_version="$(go version | awk '{print $3}')"
-[[ "${actual_go_version}" == "${required_go_version}" ]] ||
-  die "go version mismatch: got ${actual_go_version}, want ${required_go_version}"
+if [[ -z "${documents_dir}" ]]; then
+  actual_go_version="$(go version | awk '{print $3}')"
+  [[ "${actual_go_version}" == "${required_go_version}" ]] ||
+    die "go version mismatch: got ${actual_go_version}, want ${required_go_version}"
 
-go_cache_dir="${GOCACHE:-${TMPDIR:-/tmp}/tunnel-client-runtime-go-cache}"
-go_mod_cache_dir="${GOMODCACHE:-${TMPDIR:-/tmp}/tunnel-client-runtime-go-mod-cache}"
-mkdir -p "${go_cache_dir}" "${go_mod_cache_dir}"
+  go_cache_dir="${GOCACHE:-${TMPDIR:-/tmp}/tunnel-client-runtime-go-cache}"
+  go_mod_cache_dir="${GOMODCACHE:-${TMPDIR:-/tmp}/tunnel-client-runtime-go-mod-cache}"
+  mkdir -p "${go_cache_dir}" "${go_mod_cache_dir}"
+fi
 
 for required_file in LICENSE NOTICE; do
   [[ -f "${required_file}" ]] || die "required payload file is missing: ${required_file}"
@@ -158,14 +180,16 @@ cloudflared_manifest="${PROJECT_ROOT}/pkg/cloudflared/manifest.json"
   die "companion manifest is missing: pkg/cloudflared/manifest.json"
 cloudflared_manifest_sha="$(sha256_file "${cloudflared_manifest}")"
 
-syft_bin="$("${SCRIPT_DIR}/install_syft.sh")"
-[[ "${syft_bin}" == /* && -x "${syft_bin}" ]] ||
-  die "installer did not return an executable absolute path"
-version_output="$("${syft_bin}" version 2>&1)" ||
-  die "could not run Syft version check"
-printf '%s\n' "${version_output}" |
-  grep -Eq '^[[:space:]]*Version:[[:space:]]+v?1\.46\.0([[:space:]]|$)' ||
-  die "Syft must report version ${SYFT_VERSION}"
+if [[ -z "${documents_dir}" ]]; then
+  syft_bin="$("${SCRIPT_DIR}/install_syft.sh")"
+  [[ "${syft_bin}" == /* && -x "${syft_bin}" ]] ||
+    die "installer did not return an executable absolute path"
+  version_output="$("${syft_bin}" version 2>&1)" ||
+    die "could not run Syft version check"
+  printf '%s\n' "${version_output}" |
+    grep -Eq '^[[:space:]]*Version:[[:space:]]+v?1\.46\.0([[:space:]]|$)' ||
+    die "Syft must report version ${SYFT_VERSION}"
+fi
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/tunnel-client-sbom-baselines.XXXXXX")"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -211,17 +235,19 @@ for path in sorted(root.rglob("*")):
 PY
 }
 
-create_canonical_source
-module_path="$(
-  cd "${canonical_source_root}"
-  env \
-    GOWORK=off \
-    GOCACHE="${go_cache_dir}" \
-    GOMODCACHE="${go_mod_cache_dir}" \
-    go list -m -f '{{.Path}}'
-)"
-[[ "${module_path}" == "${CANONICAL_MODULE_PATH}" ]] ||
-  die "canonical source module path mismatch: got ${module_path}, want ${CANONICAL_MODULE_PATH}"
+if [[ -z "${documents_dir}" ]]; then
+  create_canonical_source
+  module_path="$(
+    cd "${canonical_source_root}"
+    env \
+      GOWORK=off \
+      GOCACHE="${go_cache_dir}" \
+      GOMODCACHE="${go_mod_cache_dir}" \
+      go list -m -f '{{.Path}}'
+  )"
+  [[ "${module_path}" == "${CANONICAL_MODULE_PATH}" ]] ||
+    die "canonical source module path mismatch: got ${module_path}, want ${CANONICAL_MODULE_PATH}"
+fi
 
 license_report_for() {
   local selected_flavor="$1"
@@ -510,9 +536,55 @@ PY
   exit 0
 fi
 
-build_baseline client
-build_baseline runtime
-build_baseline runtime-cloudflared
+if [[ -n "${documents_dir}" ]]; then
+  # The caller binds the complete documents to this source/tool invocation.
+  # Stage bytes unchanged; validate before publishing any document or manifest.
+  python3 - "${documents_dir}" "${generated_dir}" "${SYFT_VERSION}" "${PLATFORMS[@]}" <<'PY_IMPORT'
+import json
+import pathlib
+import sys
+
+source_dir = pathlib.Path(sys.argv[1])
+generated_dir = pathlib.Path(sys.argv[2])
+syft_version = sys.argv[3]
+platforms = sys.argv[4:]
+names = ("tunnel-client", "tunnel-client-runtime", "tunnel-client-runtime-cloudflared")
+expected = {name + ".spdx.json" for name in names}
+if {path.name for path in source_dir.glob("*.spdx.json")} != expected:
+    raise SystemExit("--from-documents requires exactly the three baseline SPDX documents")
+
+for name in names:
+    source = source_dir / (name + ".spdx.json")
+    if not source.is_file() or source.is_symlink():
+        raise SystemExit(f"baseline document is not a regular file: {source.name}")
+    content = source.read_bytes()
+    document = json.loads(content)
+    if not isinstance(document, dict) or document.get("spdxVersion") != "SPDX-2.3":
+        raise SystemExit(f"baseline document is not SPDX 2.3: {source.name}")
+    if document.get("name") != name + "-baseline":
+        raise SystemExit(f"baseline document flavor mismatch: {source.name}")
+    creation_info = document.get("creationInfo")
+    if not isinstance(creation_info, dict):
+        raise SystemExit(f"baseline document has no creation info: {source.name}")
+    creators = creation_info.get("creators", [])
+    if not isinstance(creators, list) or f"Tool: syft-{syft_version}" not in creators:
+        raise SystemExit(f"baseline document Syft version mismatch: {source.name}")
+    entries = document.get("files")
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        raise SystemExit(f"baseline document has no file inventory: {source.name}")
+    files = {entry.get("fileName") for entry in entries}
+    for platform in platforms:
+        goos, goarch = platform.split("/")
+        binary = name + (".exe" if goos == "windows" else "")
+        if f"payloads/{goos}_{goarch}/{binary}" not in files:
+            raise SystemExit(f"baseline document is missing {platform}: {source.name}")
+    (generated_dir / source.name).write_bytes(content)
+PY_IMPORT
+else
+  build_baseline client
+  build_baseline runtime
+  build_baseline runtime-cloudflared
+fi
 verify_subset_contracts
 
 client_sha="$(sha256_file "${generated_dir}/tunnel-client.spdx.json")"

@@ -169,6 +169,12 @@ fi
 
 "${generator}" "${generator_args[@]}"
 
+# Preserve the genuine generated document even when its baseline is stale.
+if [[ -n "${TEST_UNDECLARED_OUTPUTS_DIR:-}" ]]; then
+  mkdir -p "${TEST_UNDECLARED_OUTPUTS_DIR}"
+  cp "${generated_root}/${output_name}" "${TEST_UNDECLARED_OUTPUTS_DIR}/${output_name}"
+fi
+
 if ! diff -u "${expected}" "${generated_root}/${output_name}"; then
   echo "${flavor} SBOM baseline is stale" >&2
   exit 1
