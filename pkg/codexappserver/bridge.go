@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,24 +72,30 @@ type TurnState struct {
 }
 
 type Snapshot struct {
-	Command            string         `json:"command"`
-	CommandArgs        []string       `json:"command_args,omitempty"`
-	CommandCWD         string         `json:"command_cwd,omitempty"`
-	PID                int            `json:"pid,omitempty"`
-	Running            bool           `json:"running"`
-	Starting           bool           `json:"starting"`
-	Ready              bool           `json:"ready"`
-	Initialized        bool           `json:"initialized"`
-	LastError          string         `json:"last_error,omitempty"`
-	StartedAt          time.Time      `json:"started_at"`
-	LastExitAt         time.Time      `json:"last_exit_at"`
-	InitializeInfo     InitializeInfo `json:"initialize_info"`
-	AuthMethod         string         `json:"auth_method,omitempty"`
-	RequiresOpenAIAuth *bool          `json:"requires_openai_auth,omitempty"`
-	Account            *Account       `json:"account,omitempty"`
-	Login              *LoginState    `json:"login,omitempty"`
-	Thread             *ThreadState   `json:"thread,omitempty"`
-	Turn               *TurnState     `json:"turn,omitempty"`
+	Mode                 string         `json:"mode"`
+	SocketPath           string         `json:"socket_path,omitempty"`
+	DaemonPID            int            `json:"daemon_pid,omitempty"`
+	ConnectionGeneration uint64         `json:"connection_generation,omitempty"`
+	Command              string         `json:"command"`
+	CommandArgs          []string       `json:"command_args,omitempty"`
+	CommandCWD           string         `json:"command_cwd,omitempty"`
+	PID                  int            `json:"pid,omitempty"`
+	Running              bool           `json:"running"`
+	Starting             bool           `json:"starting"`
+	Ready                bool           `json:"ready"`
+	Initialized          bool           `json:"initialized"`
+	LastError            string         `json:"last_error,omitempty"`
+	StartedAt            time.Time      `json:"started_at"`
+	LastExitAt           time.Time      `json:"last_exit_at"`
+	InitializeInfo       InitializeInfo `json:"initialize_info"`
+	AuthMethod           string         `json:"auth_method,omitempty"`
+	RequiresOpenAIAuth   *bool          `json:"requires_openai_auth,omitempty"`
+	Account              *Account       `json:"account,omitempty"`
+	Login                *LoginState    `json:"login,omitempty"`
+	Thread               *ThreadState   `json:"thread,omitempty"`
+	Turn                 *TurnState     `json:"turn,omitempty"`
+	Threads              []ThreadState  `json:"threads,omitempty"`
+	Turns                []TurnState    `json:"turns,omitempty"`
 }
 
 type Event struct {
@@ -163,6 +171,8 @@ type pendingRequest struct {
 }
 
 type commandConfig struct {
+	mode    string
+	socket  string
 	command string
 	args    []string
 	cwd     string
@@ -201,6 +211,14 @@ type Bridge struct {
 	requestSeq    atomic.Int64
 	eventSeq      atomic.Int64
 	processStderr []string
+	daemon        *daemonSession
+	daemonPID     int
+	generation    uint64
+	threads       map[string]*ThreadState
+	turns         map[string]*TurnState
+	stopCh        chan struct{}
+	stopOnce      sync.Once
+	reconnecting  bool
 }
 
 func NewBridge(lifecycle fx.Lifecycle, logger *slog.Logger) *Bridge {
@@ -220,10 +238,17 @@ func NewBridgeWithLookupEnv(lifecycle fx.Lifecycle, logger *slog.Logger, lookupE
 		eventHistory: make([]Event, defaultEventCapacity),
 		subscribers:  make(map[chan Event]struct{}),
 		pending:      make(map[int64]pendingRequest),
+		threads:      make(map[string]*ThreadState),
+		turns:        make(map[string]*TurnState),
+		stopCh:       make(chan struct{}),
 	}
 	if lifecycle != nil {
 		lifecycle.Append(fx.Hook{
 			OnStart: func(context.Context) error {
+				if b.cfg.mode == "daemon" {
+					b.startDaemonReconnect()
+					return nil
+				}
 				go func() {
 					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 					defer cancel()
@@ -252,6 +277,20 @@ func defaultCommandConfig(lookupEnv func(string) (string, bool)) commandConfig {
 	cwd, _ := os.Getwd()
 	if envCWD := strings.TrimSpace(getenv("TUNNEL_CLIENT_CODEX_APP_SERVER_CWD")); envCWD != "" {
 		cwd = envCWD
+	}
+	mode := strings.TrimSpace(getenv("TUNNEL_CLIENT_CODEX_APP_SERVER_MODE"))
+	if mode != "" && mode != "spawn" {
+		socket := strings.TrimSpace(getenv("TUNNEL_CLIENT_CODEX_APP_SERVER_SOCKET"))
+		if socket == "" {
+			home := strings.TrimSpace(getenv("CODEX_HOME"))
+			if home == "" {
+				userHome, _ := os.UserHomeDir()
+				home = filepath.Join(userHome, ".codex")
+			}
+			socket = filepath.Join(home, "app-server-control", "app-server-control.sock")
+		}
+		// Daemon mode never evaluates command overrides, shells or PATH.
+		return commandConfig{mode: mode, socket: socket, cwd: cwd}
 	}
 	if envCommand := strings.TrimSpace(getenv("TUNNEL_CLIENT_CODEX_APP_SERVER_COMMAND")); envCommand != "" {
 		return commandConfig{
@@ -300,8 +339,15 @@ func (b *Bridge) Warmup() {
 }
 
 func (b *Bridge) EnsureStarted(ctx context.Context) error {
+	if b.cfg.mode != "" && b.cfg.mode != "spawn" && b.cfg.mode != "daemon" {
+		return fmt.Errorf("unsupported Codex app-server mode %q", b.cfg.mode)
+	}
 	for {
 		b.mu.Lock()
+		if b.shuttingDown {
+			b.mu.Unlock()
+			return errors.New("Codex bridge is stopped")
+		}
 		if b.ready {
 			b.mu.Unlock()
 			return nil
@@ -328,12 +374,27 @@ func (b *Bridge) EnsureStarted(ctx context.Context) error {
 			return ctx.Err()
 		case <-ch:
 		}
+		if b.cfg.mode == "daemon" {
+			b.mu.RLock()
+			ready := b.ready
+			b.mu.RUnlock()
+			if !ready {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-b.stopCh:
+					return errors.New("Codex bridge is stopped")
+				case <-time.After(250 * time.Millisecond):
+				}
+			}
+		}
 	}
 }
 
 func (b *Bridge) Stop(ctx context.Context) error {
 	b.mu.Lock()
 	b.shuttingDown = true
+	b.stopOnce.Do(func() { close(b.stopCh) })
 	cmd := b.cmd
 	waitDone := b.waitDone
 	stdin := b.stdin
@@ -341,6 +402,16 @@ func (b *Bridge) Stop(ctx context.Context) error {
 
 	if stdin != nil {
 		_ = stdin.Close()
+	}
+	if b.cfg.mode == "daemon" {
+		if waitDone != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-waitDone:
+			}
+		}
+		return nil
 	}
 	if cmd == nil || cmd.Process == nil {
 		return nil
@@ -362,17 +433,21 @@ func (b *Bridge) Snapshot() Snapshot {
 	defer b.mu.RUnlock()
 
 	out := Snapshot{
-		Command:     b.cfg.command,
-		CommandArgs: append([]string(nil), b.cfg.args...),
-		CommandCWD:  b.cfg.cwd,
-		PID:         b.pid,
-		Running:     b.running,
-		Starting:    b.starting,
-		Ready:       b.ready,
-		Initialized: b.ready,
-		LastError:   b.lastError,
-		StartedAt:   b.startedAt,
-		LastExitAt:  b.lastExitAt,
+		Mode:                 b.cfg.mode,
+		SocketPath:           b.cfg.socket,
+		DaemonPID:            b.daemonPID,
+		ConnectionGeneration: b.generation,
+		Command:              b.cfg.command,
+		CommandArgs:          append([]string(nil), b.cfg.args...),
+		CommandCWD:           b.cfg.cwd,
+		PID:                  b.pid,
+		Running:              b.running,
+		Starting:             b.starting,
+		Ready:                b.ready,
+		Initialized:          b.ready,
+		LastError:            b.lastError,
+		StartedAt:            b.startedAt,
+		LastExitAt:           b.lastExitAt,
 		InitializeInfo: InitializeInfo{
 			UserAgent:      b.initialize.UserAgent,
 			CodexHome:      b.initialize.CodexHome,
@@ -380,6 +455,19 @@ func (b *Bridge) Snapshot() Snapshot {
 			PlatformOS:     b.initialize.PlatformOS,
 		},
 		AuthMethod: b.authMethod,
+	}
+	if out.Mode == "" {
+		out.Mode = "spawn"
+	}
+	if b.cfg.mode == "daemon" {
+		for _, thread := range b.threads {
+			out.Threads = append(out.Threads, *thread)
+		}
+		for _, turn := range b.turns {
+			out.Turns = append(out.Turns, *turn)
+		}
+		sort.Slice(out.Threads, func(i, j int) bool { return out.Threads[i].ID < out.Threads[j].ID })
+		sort.Slice(out.Turns, func(i, j int) bool { return out.Turns[i].ID < out.Turns[j].ID })
 	}
 	if b.requiresAuth != nil {
 		value := *b.requiresAuth
@@ -483,6 +571,9 @@ func (b *Bridge) Subscribe(ctx context.Context) <-chan Event {
 }
 
 func (b *Bridge) StartDeviceCodeLogin(ctx context.Context) (DeviceCodeLoginResult, error) {
+	if b.cfg.mode == "daemon" {
+		return DeviceCodeLoginResult{}, errors.New("shared daemon authentication is managed canonically; tunnel login is disabled")
+	}
 	if err := b.EnsureStarted(ctx); err != nil {
 		return DeviceCodeLoginResult{}, err
 	}
@@ -525,6 +616,9 @@ func (b *Bridge) StartDeviceCodeLogin(ctx context.Context) (DeviceCodeLoginResul
 }
 
 func (b *Bridge) CancelLogin(ctx context.Context, loginID string) error {
+	if b.cfg.mode == "daemon" {
+		return errors.New("shared daemon authentication is managed canonically; tunnel login cancellation is disabled")
+	}
 	if strings.TrimSpace(loginID) == "" {
 		b.mu.RLock()
 		if b.login != nil {
@@ -552,6 +646,12 @@ func (b *Bridge) CancelLogin(ctx context.Context, loginID string) error {
 func (b *Bridge) StartThread(ctx context.Context, params ThreadStartParams) (ThreadStartResult, error) {
 	if err := b.EnsureStarted(ctx); err != nil {
 		return ThreadStartResult{}, err
+	}
+	b.mu.RLock()
+	generation := b.generation
+	b.mu.RUnlock()
+	if b.cfg.mode == "daemon" && params.CWD == "" {
+		params.CWD = b.cfg.cwd
 	}
 	stageTimeout := boundedTimeout(ctx, defaultRequestTimeout)
 	stageCtx, cancel := context.WithTimeout(ctx, stageTimeout)
@@ -616,11 +716,16 @@ func (b *Bridge) StartThread(ctx context.Context, params ThreadStartParams) (Thr
 		UpdatedAt:      unixSeconds(response.Thread.UpdatedAt),
 	}
 	b.mu.Lock()
+	if b.cfg.mode == "daemon" && (b.generation != generation || b.daemon == nil) {
+		b.mu.Unlock()
+		return ThreadStartResult{}, errors.New("daemon disconnected after thread/start; request was not replayed")
+	}
+	if b.cfg.mode == "daemon" {
+		b.threads[thread.ID] = thread
+	}
 	b.thread = thread
 	b.turn = nil
-	b.mu.Unlock()
-
-	return ThreadStartResult{
+	out := ThreadStartResult{
 		ThreadID:       thread.ID,
 		CWD:            thread.CWD,
 		Model:          thread.Model,
@@ -628,7 +733,9 @@ func (b *Bridge) StartThread(ctx context.Context, params ThreadStartParams) (Thr
 		ApprovalPolicy: thread.ApprovalPolicy,
 		Sandbox:        thread.Sandbox,
 		ThreadPreview:  thread.Preview,
-	}, nil
+	}
+	b.mu.Unlock()
+	return out, nil
 }
 
 func (b *Bridge) StartTurn(ctx context.Context, params TurnStartParams) (TurnStartResult, error) {
@@ -637,7 +744,10 @@ func (b *Bridge) StartTurn(ctx context.Context, params TurnStartParams) (TurnSta
 	}
 	if strings.TrimSpace(params.ThreadID) == "" {
 		b.mu.RLock()
-		if b.thread != nil {
+		if b.cfg.mode == "daemon" && len(b.threads) != 1 {
+			b.mu.RUnlock()
+			return TurnStartResult{}, errors.New("explicit thread id is required with multiple daemon threads")
+		} else if b.thread != nil {
 			params.ThreadID = b.thread.ID
 		}
 		b.mu.RUnlock()
@@ -645,6 +755,12 @@ func (b *Bridge) StartTurn(ctx context.Context, params TurnStartParams) (TurnSta
 	if strings.TrimSpace(params.ThreadID) == "" {
 		return TurnStartResult{}, errors.New("thread id is required")
 	}
+	if err := b.requireDaemonThread(params.ThreadID); err != nil {
+		return TurnStartResult{}, err
+	}
+	b.mu.RLock()
+	generation := b.generation
+	b.mu.RUnlock()
 	stageTimeout := boundedTimeout(ctx, defaultRequestTimeout)
 	stageCtx, cancel := context.WithTimeout(ctx, stageTimeout)
 	defer cancel()
@@ -694,23 +810,37 @@ func (b *Bridge) StartTurn(ctx context.Context, params TurnStartParams) (TurnSta
 		UpdatedAt: time.Now().UTC(),
 	}
 	b.mu.Lock()
-	if b.turn != nil && b.turn.ID == turn.ID {
+	if b.cfg.mode == "daemon" && (b.generation != generation || b.daemon == nil) {
+		b.mu.Unlock()
+		return TurnStartResult{}, errors.New("daemon disconnected after turn/start; request outcome may be unknown; request was not replayed")
+	}
+	previous := b.turn
+	if b.cfg.mode == "daemon" {
+		previous = b.turns[turn.ID]
+	}
+	if previous != nil && previous.ID == turn.ID {
 		if turn.ThreadID == "" {
-			turn.ThreadID = b.turn.ThreadID
+			turn.ThreadID = previous.ThreadID
 		}
-		if isTerminalTurnStatus(b.turn.Status) {
-			turn.Status = b.turn.Status
-			turn.Error = b.turn.Error
-			turn.UpdatedAt = b.turn.UpdatedAt
+		if isTerminalTurnStatus(previous.Status) {
+			turn.Status = previous.Status
+			turn.Error = previous.Error
+			turn.UpdatedAt = previous.UpdatedAt
 		}
 	}
-	b.turn = turn
-	b.mu.Unlock()
-	return TurnStartResult{
+	if b.cfg.mode == "daemon" {
+		b.turns[turn.ID] = turn
+	}
+	if b.cfg.mode != "daemon" || b.thread != nil && b.thread.ID == turn.ThreadID {
+		b.turn = turn
+	}
+	out := TurnStartResult{
 		TurnID:   turn.ID,
 		ThreadID: turn.ThreadID,
 		Status:   turn.Status,
-	}, nil
+	}
+	b.mu.Unlock()
+	return out, nil
 }
 
 func (b *Bridge) InjectThreadItems(ctx context.Context, threadID string, items []map[string]any) error {
@@ -719,6 +849,9 @@ func (b *Bridge) InjectThreadItems(ctx context.Context, threadID string, items [
 	}
 	if strings.TrimSpace(threadID) == "" {
 		return errors.New("thread id is required")
+	}
+	if err := b.requireDaemonThread(threadID); err != nil {
+		return err
 	}
 	if len(items) == 0 {
 		return nil
@@ -750,12 +883,15 @@ func (b *Bridge) startProcess(done chan struct{}) {
 
 	b.mu.Lock()
 	b.starting = false
-	b.ready = true
+	b.ready = b.running && !b.shuttingDown
 	b.lastError = ""
 	b.mu.Unlock()
 }
 
 func (b *Bridge) startProcessLocked() error {
+	if b.cfg.mode == "daemon" {
+		return b.connectDaemon()
+	}
 	cmd := exec.Command(b.cfg.command, b.cfg.args...)
 	cmd.Dir = b.cfg.cwd
 	cmd.Env = os.Environ()
@@ -812,13 +948,17 @@ func (b *Bridge) initializeProcess(ctx context.Context) error {
 	initCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
+	var capabilities any
+	if b.cfg.mode == "daemon" {
+		capabilities = map[string]any{"experimentalApi": true}
+	}
 	result, err := b.requestNoEnsure(initCtx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
 			"name":    "tunnel-client-adminui",
 			"title":   "tunnel-client admin UI",
 			"version": "0.1.0",
 		},
-		"capabilities": nil,
+		"capabilities": capabilities,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize: %w", err)
@@ -826,6 +966,28 @@ func (b *Bridge) initializeProcess(ctx context.Context) error {
 	var response InitializeInfo
 	if err := json.Unmarshal(result, &response); err != nil {
 		return fmt.Errorf("decode initialize response: %w", err)
+	}
+	// Native app-server returns camelCase; Snapshot keeps its public snake_case.
+	var native struct {
+		UserAgent      string `json:"userAgent"`
+		CodexHome      string `json:"codexHome"`
+		PlatformFamily string `json:"platformFamily"`
+		PlatformOS     string `json:"platformOs"`
+	}
+	if err := json.Unmarshal(result, &native); err != nil {
+		return err
+	}
+	if native.UserAgent != "" {
+		response.UserAgent = native.UserAgent
+	}
+	if native.CodexHome != "" {
+		response.CodexHome = native.CodexHome
+	}
+	if native.PlatformFamily != "" {
+		response.PlatformFamily = native.PlatformFamily
+	}
+	if native.PlatformOS != "" {
+		response.PlatformOS = native.PlatformOS
 	}
 	if err := b.notify(initCtx, "initialized", map[string]any{}); err != nil {
 		return fmt.Errorf("initialized notification: %w", err)
@@ -896,6 +1058,9 @@ func (b *Bridge) request(ctx context.Context, method string, params map[string]a
 }
 
 func (b *Bridge) requestNoEnsure(ctx context.Context, method string, params map[string]any) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	payloadID := b.requestSeq.Add(1)
 	envelope := map[string]any{
 		"id":     payloadID,
@@ -911,6 +1076,14 @@ func (b *Bridge) requestNoEnsure(ctx context.Context, method string, params map[
 	respCh := make(chan rpcEnvelope, 1)
 
 	b.mu.Lock()
+	if b.cfg.mode == "daemon" {
+		if threadID, ok := params["threadId"].(string); ok && threadID != "" {
+			if b.threads[threadID] == nil {
+				b.mu.Unlock()
+				return nil, errors.New("thread is not owned by this daemon connection; request was not sent")
+			}
+		}
+	}
 	if b.stdin == nil {
 		b.mu.Unlock()
 		return nil, errors.New("codex app-server stdin unavailable")
@@ -1000,7 +1173,7 @@ func (b *Bridge) readStdout(stdout io.Reader) {
 			})
 			continue
 		}
-		if id, ok := parseRequestID(envelope.ID); ok {
+		if id, ok := parseRequestID(envelope.ID); ok && envelope.Method == "" {
 			b.mu.Lock()
 			pending, found := b.pending[id]
 			if found {
@@ -1141,6 +1314,19 @@ func (b *Bridge) handleEnvelope(envelope rpcEnvelope, raw json.RawMessage) {
 		event.TurnID = stringValue(params["turnId"])
 		event.ItemID = stringValue(params["itemId"])
 	}
+	if b.cfg.mode == "daemon" {
+		if nested, ok := params["thread"].(map[string]any); ok && event.ThreadID == "" {
+			event.ThreadID = stringValue(nested["id"])
+		}
+		if event.ThreadID != "" {
+			b.mu.RLock()
+			_, owned := b.threads[event.ThreadID]
+			b.mu.RUnlock()
+			if !owned {
+				return
+			}
+		}
+	}
 
 	switch envelope.Method {
 	case "mcpServer/startupStatus/updated", "account/rateLimits/updated":
@@ -1189,14 +1375,23 @@ func (b *Bridge) handleEnvelope(envelope rpcEnvelope, raw json.RawMessage) {
 		}
 		if err := json.Unmarshal(envelope.Params, &payload); err == nil && payload.Thread.ID != "" {
 			b.mu.Lock()
-			b.thread = &ThreadState{
+			thread := &ThreadState{
 				ID:        payload.Thread.ID,
 				Preview:   payload.Thread.Preview,
 				CWD:       payload.Thread.CWD,
 				CreatedAt: unixSeconds(payload.Thread.CreatedAt),
 				UpdatedAt: unixSeconds(payload.Thread.UpdatedAt),
 			}
-			b.turn = nil
+			if b.cfg.mode == "daemon" {
+				// Do not let daemon-wide broadcasts replace another selected thread.
+				if known := b.threads[thread.ID]; known != nil {
+					known.Preview = thread.Preview
+					known.UpdatedAt = thread.UpdatedAt
+				}
+			} else {
+				b.thread = thread
+				b.turn = nil
+			}
 			b.mu.Unlock()
 			event.ThreadID = payload.Thread.ID
 			event.Summary = "thread started"
@@ -1223,11 +1418,17 @@ func (b *Bridge) handleEnvelope(envelope rpcEnvelope, raw json.RawMessage) {
 				threadID = stringValue(params["threadId"])
 			}
 			b.mu.Lock()
-			b.turn = &TurnState{
+			turn := &TurnState{
 				ID:        payload.Turn.ID,
 				ThreadID:  threadID,
 				Status:    payload.Turn.Status,
 				UpdatedAt: time.Now().UTC(),
+			}
+			if b.cfg.mode == "daemon" {
+				b.turns[turn.ID] = turn
+			}
+			if b.cfg.mode != "daemon" || b.thread != nil && b.thread.ID == threadID {
+				b.turn = turn
 			}
 			b.mu.Unlock()
 			event.ThreadID = threadID
@@ -1268,7 +1469,12 @@ func (b *Bridge) handleEnvelope(envelope rpcEnvelope, raw json.RawMessage) {
 				turn.Error = payload.Turn.Error.Message
 			}
 			b.mu.Lock()
-			b.turn = turn
+			if b.cfg.mode == "daemon" {
+				b.turns[turn.ID] = turn
+			}
+			if b.cfg.mode != "daemon" || b.thread != nil && b.thread.ID == threadID {
+				b.turn = turn
+			}
 			b.mu.Unlock()
 			event.ThreadID = threadID
 			event.TurnID = payload.Turn.ID

@@ -718,6 +718,9 @@ make admin-ui
   one-shot mode and TTY stdin for REPL mode. It defaults to `medium`
   reasoning effort, and the REPL supports `/model` to inspect or change model
   and reasoning without restarting.
+- The full-client Codex bridge can instead connect directly to one existing
+  machine daemon with `TUNNEL_CLIENT_CODEX_APP_SERVER_MODE=daemon`, without
+  spawning a Codex child. See [shared daemon configuration and lifecycle](docs/shared-codex-daemon.md).
 - `tunnel-client codex status|install|upgrade|uninstall` inspects local Codex
   CLI/app-server availability and prints the official install/upgrade/remove
   commands.
