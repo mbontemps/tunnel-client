@@ -3,6 +3,7 @@ Platforms: linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, windows/amd64, 
 Tests included: false
 License summary (all licenses currently in use; additions require legal approval and #release-approval sign-off):
   Apache-2.0
+  BSD-2-Clause
   BSD-3-Clause
   MIT
 
@@ -16,6 +17,7 @@ github.com/go-logr/logr|transitive|v1.4.3|Apache-2.0|github.com/go-logr/logr@v1.
 github.com/go-logr/stdr|transitive|v1.2.2|Apache-2.0|github.com/go-logr/stdr@v1.2.2/LICENSE|darwin/amd64,darwin/arm64,linux/amd64,linux/arm64,windows/amd64,windows/arm64
 github.com/google/jsonschema-go/jsonschema|transitive|v0.4.3|MIT|github.com/google/jsonschema-go@v0.4.3/LICENSE|darwin/amd64,darwin/arm64,linux/amd64,linux/arm64,windows/amd64,windows/arm64
 github.com/google/uuid|direct|v1.6.0|BSD-3-Clause|github.com/google/uuid@v1.6.0/LICENSE|darwin/amd64,darwin/arm64,linux/amd64,linux/arm64,windows/amd64,windows/arm64
+github.com/gorilla/websocket|direct|v1.5.3|BSD-2-Clause|github.com/gorilla/websocket@v1.5.3/LICENSE|darwin/amd64,darwin/arm64,linux/amd64,linux/arm64
 github.com/grafana/regexp|transitive|v0.0.0-20240518133315-a468a5bfb3bc|BSD-3-Clause|github.com/grafana/regexp@v0.0.0-20240518133315-a468a5bfb3bc/LICENSE|darwin/amd64,darwin/arm64,linux/amd64,linux/arm64,windows/amd64,windows/arm64
 github.com/inconshreveable/mousetrap|transitive|v1.1.0|Apache-2.0|github.com/inconshreveable/mousetrap@v1.1.0/LICENSE|windows/amd64,windows/arm64
 github.com/invopop/jsonschema|direct|v0.13.0|MIT|github.com/invopop/jsonschema@v0.13.0/COPYING|darwin/amd64,darwin/arm64,linux/amd64,linux/arm64,windows/amd64,windows/arm64
