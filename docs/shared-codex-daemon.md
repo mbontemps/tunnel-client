@@ -71,6 +71,9 @@ TUNNEL_CLIENT_TEST_DAEMON_SOCKET=/absolute/path/to/existing/socket \
 The opt-in native test only connects, reads account/model metadata, creates two
 ephemeral threads without turns, and closes its own connections. It never
 starts/restarts the daemon, generates model output, or invokes business tools.
+It also checks the actual native response for distinct cwd, model
+(`gpt-6-sol` / `gpt-6-astra`), sandbox (`read-only` / `workspace-write`) and
+approval policies (`never` / `on-request`); no command or write is executed.
 The hermetic suite tests concurrent RPCs/threads, foreign broadcasts, restart
 and reconnection, no mutation replay, server-request ID collisions, unsafe
 socket rejection, and stopping one bridge while the other remains usable.

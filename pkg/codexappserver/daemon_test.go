@@ -435,11 +435,17 @@ func TestNativeDaemonReadOnlyContract(t *testing.T) {
 	require.Equal(t, bridges[0].Snapshot().DaemonPID, bridges[1].Snapshot().DaemonPID)
 	var wg sync.WaitGroup
 	results := make([]ThreadStartResult, 2)
+	workingDir, err := os.Getwd()
+	require.NoError(t, err)
+	threadParams := []ThreadStartParams{
+		{CWD: os.TempDir(), Model: "gpt-6-sol", SandboxType: "read-only", ApprovalPolicy: "never"},
+		{CWD: workingDir, Model: "gpt-6-astra", SandboxType: "workspace-write", ApprovalPolicy: "on-request"},
+	}
 	for i, b := range bridges {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			thread, err := b.StartThread(ctx, ThreadStartParams{CWD: os.TempDir(), Model: "gpt-6-sol", SandboxType: "read-only", ApprovalPolicy: "never"})
+			thread, err := b.StartThread(ctx, threadParams[i])
 			if assertNoError(t, err) {
 				results[i] = thread
 			}
@@ -448,6 +454,16 @@ func TestNativeDaemonReadOnlyContract(t *testing.T) {
 	wg.Wait()
 	require.NotEmpty(t, results[0].ThreadID)
 	require.NotEqual(t, results[0].ThreadID, results[1].ThreadID)
+	for i, result := range results {
+		wantCWD, err := filepath.EvalSymlinks(threadParams[i].CWD)
+		require.NoError(t, err)
+		gotCWD, err := filepath.EvalSymlinks(result.CWD)
+		require.NoError(t, err)
+		require.Equal(t, wantCWD, gotCWD)
+		require.Equal(t, threadParams[i].Model, result.Model)
+		require.Equal(t, threadParams[i].ApprovalPolicy, result.ApprovalPolicy)
+		require.Equal(t, threadParams[i].SandboxType, normalizeSandboxType(result.Sandbox))
+	}
 	for _, b := range bridges {
 		require.Len(t, b.Snapshot().Threads, 1)
 		for _, e := range b.RecentEvents(100) {
@@ -457,7 +473,7 @@ func TestNativeDaemonReadOnlyContract(t *testing.T) {
 		}
 	}
 	require.NoError(t, bridges[0].Stop(ctx))
-	_, err := bridges[1].request(ctx, "model/list", map[string]any{"limit": 1})
+	_, err = bridges[1].request(ctx, "model/list", map[string]any{"limit": 1})
 	require.NoError(t, err)
 	t.Logf("same daemon PID=%d; independent ephemeral threads; no turns/tools/auth writes", bridges[1].Snapshot().DaemonPID)
 }
